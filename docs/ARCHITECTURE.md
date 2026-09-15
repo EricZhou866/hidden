@@ -134,10 +134,18 @@ throwaway probe item rather than the separator's own geometry:
 2. Binary-search the largest length at which the probe is still driven away from
    its resting position. That is a direct read of "is the separator actually
    pushing anything", which is the property that matters.
-3. Step back `ejectionSafetyMargin` (24pt) from the cutoff, cache, remove the
-   probe.
-4. Re-measure when the display configuration changes, and whenever a collapse
-   finds the cached length ejected (rate-limited).
+3. Step back `ejectionSafetyMargin` (24pt) from the cutoff.
+4. **Re-enter the layout, then climb back up.** Finding the cutoff requires
+   probing past it, which leaves the bar ejected, and a good length written on
+   top of an ejected layout stays ejected - the measurement is then correct and
+   still hides nothing. Worse, once ejected the cutoff itself drops, so a value
+   just under the measured one is also refused: measured on 27.0, after ejecting
+   at 1011pt none of 983 / 953 / 925 re-entered, while 737 did. So: reset to the
+   resting width, step down (x0.75) until a value verifies as pushing, then climb
+   back up (x1.08) - going up from a pushing layout is safe - keeping the last
+   value that still pushes. This recovers the full measured length.
+5. Cache, remove the probe. Re-measure when the display configuration changes,
+   and whenever a collapse finds the cached length ejected (rate-limited).
 
 **Why not read the separator's own frame.** Two signals were tried first and both
 mislead:

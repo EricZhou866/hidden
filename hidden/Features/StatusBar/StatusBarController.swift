@@ -342,6 +342,13 @@ class StatusBarController {
     // sooner than this returns the pre-layout value, which reads as "ejected" and
     // would collapse the calibration onto its lower bound (= no hiding at all).
     private static let layoutSettleDelay: TimeInterval = 0.12
+    // Re-entering the layout from the resting width takes materially longer to
+    // settle than a plain length write, and a reading taken too early lands
+    // mid-flight: measured 1028 between a resting 1045 and a pushed 231, which
+    // reads as "not pushed" and fails a value that is in fact good.
+    private static let reflowSettleDelay: TimeInterval = 0.45
+    private static let reentryStepDown: CGFloat = 0.75
+    private static let climbStepUp: CGFloat = 1.08
     // How far the separator's arrow-facing edge may drift while still laid out.
     // Only used as a fallback; see calibrationProbe for the primary signal.
     private static let ejectionTolerance: CGFloat = 8
@@ -389,6 +396,10 @@ class StatusBarController {
 
     private func afterLayoutSettles(_ work: @escaping () -> Void) {
         DispatchQueue.main.asyncAfter(deadline: .now() + StatusBarController.layoutSettleDelay, execute: work)
+    }
+
+    private func afterReflowSettles(_ work: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + StatusBarController.reflowSettleDelay, execute: work)
     }
 
     private func applyCollapseLength() {
@@ -453,6 +464,100 @@ class StatusBarController {
         }
     }
 
+    // Apply a measured length and confirm it really pushes, retrying lower if not.
+    //
+    // This is not belt-and-braces: the search has to probe PAST the cutoff to find
+    // it, which leaves the bar in the ejected state, and writing a good length on
+    // top of an ejected layout does not recover it. The length has to be re-applied
+    // from the resting width so the bar re-flows from a non-ejected layout. Without
+    // this the measurement is correct and the result still hides nothing - the bug
+    // that made the first probe-based build look like it had not worked at all.
+    private func finishCalibration(with length: CGFloat) {
+        isCalibrating = false
+        calibrationGeneration += 1
+        calibratedCollapseLength = length
+        lastCalibrationDate = Date()
+        removeCalibrationProbe()
+        NSLog("HideMechanism: collapse length \(length) verified pushing")
+        if Preferences.areSeparatorsHidden {
+            btnAlwaysHidden?.length = alwaysHiddenCollapseLength
+        }
+    }
+
+    // Walk up from a length known to be pushing, keeping the last one that still
+    // pushes. Going up from a pushing layout does not need the re-entry dance;
+    // only the step that finally ejects does, and that is the one we back out of.
+    private func climbTowardCutoff(from verified: CGFloat, ceiling: CGFloat,
+                                   probeRest: CGFloat, stepsLeft: Int) {
+        let next = min(verified * StatusBarController.climbStepUp, ceiling)
+        guard stepsLeft > 0, next > verified + 1 else {
+            finishCalibration(with: verified)
+            return
+        }
+        let generation = calibrationGeneration
+        btnSeparate.length = next
+        afterReflowSettles { [weak self] in
+            guard let self = self, generation == self.calibrationGeneration else { return }
+            if self.isProbePushed(restingPosition: probeRest) {
+                self.climbTowardCutoff(from: next, ceiling: ceiling,
+                                       probeRest: probeRest, stepsLeft: stepsLeft - 1)
+            } else {
+                // That step ejected the bar; settle back on the last good value,
+                // which now needs a re-entry from the resting width.
+                self.btnSeparate.length = self.btnHiddenLength
+                self.afterReflowSettles {
+                    guard generation == self.calibrationGeneration else { return }
+                    self.btnSeparate.length = verified
+                    self.afterReflowSettles {
+                        guard generation == self.calibrationGeneration else { return }
+                        self.finishCalibration(with: verified)
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyCalibratedLength(_ candidate: CGFloat, ceiling: CGFloat, probeRest: CGFloat, attemptsLeft: Int) {
+        let generation = calibrationGeneration
+        // Re-enter the layout from the resting width: the search has to probe past
+        // the cutoff to find it, which leaves the bar ejected, and a length written
+        // straight on top of an ejected layout stays ejected.
+        btnSeparate.length = btnHiddenLength
+        afterReflowSettles { [weak self] in
+            guard let self = self, generation == self.calibrationGeneration else { return }
+            self.btnSeparate.length = candidate
+            self.afterReflowSettles {
+                guard generation == self.calibrationGeneration else { return }
+                if self.isProbePushed(restingPosition: probeRest) {
+                    // Re-entry succeeded, but it had to undershoot to get back in.
+                    // Climbing upward from a pushing layout is safe (that is what
+                    // the search itself does), so recover the lost push.
+                    self.climbTowardCutoff(from: candidate, ceiling: ceiling,
+                                           probeRest: probeRest, stepsLeft: 6)
+                    return
+                }
+                // Step down hard, not by a hair: once the bar has been ejected the
+                // cutoff itself drops, so a value just under the measured one is
+                // still rejected. Measured on 27.0 - after ejecting at 1011, none
+                // of 983 / 953 / 925 re-entered, while 700 did.
+                let next = candidate * StatusBarController.reentryStepDown
+                guard attemptsLeft > 1, next > self.btnHiddenLength else {
+                    // Give up rather than sit in a collapsed state that hides
+                    // nothing: leave the bar expanded and the arrow honest.
+                    NSLog("HideMechanism: no length could be verified pushing, hiding unavailable")
+                    self.isCalibrating = false
+                    self.calibrationGeneration += 1
+                    self.lastCalibrationDate = Date()
+                    self.removeCalibrationProbe()
+                    self.btnSeparate.length = self.btnHiddenLength
+                    self.btnExpandCollapse.button?.image = Assets.collapseImage
+                    return
+                }
+                self.applyCalibratedLength(next, ceiling: ceiling, probeRest: probeRest, attemptsLeft: attemptsLeft - 1)
+            }
+        }
+    }
+
     private func removeCalibrationProbe() {
         if let probe = calibrationProbe {
             NSStatusBar.system.removeStatusItem(probe)
@@ -489,10 +594,14 @@ class StatusBarController {
 
             func probe() {
                 guard high - low > StatusBarController.calibrationPrecision else {
-                    self.isCalibrating = false
-                    self.calibrationGeneration += 1
-                    self.removeCalibrationProbe()
+                    // NB: isCalibrating stays true until applyCalibratedLength has
+                    // verified a value. Clearing it here lets the collapse that is
+                    // waiting on this measurement start a second one, which bumps
+                    // the generation and cancels the apply chain mid-flight.
                     guard best > self.btnHiddenLength else {
+                        self.isCalibrating = false
+                        self.calibrationGeneration += 1
+                        self.removeCalibrationProbe()
                         // Not even a few points are laid out: this menu bar cannot
                         // hide anything by inflation. Leave the bar expanded and
                         // the arrow honest rather than sitting in a collapsed state
@@ -506,15 +615,10 @@ class StatusBarController {
                     let margin = min(StatusBarController.ejectionSafetyMargin,
                                      best * StatusBarController.ejectionSafetyFraction)
                     best -= margin
-                    self.calibratedCollapseLength = best
-                    self.lastCalibrationDate = Date()
-                    NSLog("HideMechanism: calibrated collapse length \(best) (probe rest \(probeRest), baseline edge \(baseline), ceiling \(self.btnHiddenCollapseLength))")
+
                     // Land in whichever state the bar was meant to be in: the
                     // calibration is what performs the first collapse.
-                    self.btnSeparate.length = best
-                    if Preferences.areSeparatorsHidden {
-                        self.btnAlwaysHidden?.length = self.alwaysHiddenCollapseLength
-                    }
+                    self.applyCalibratedLength(best, ceiling: best, probeRest: probeRest, attemptsLeft: 5)
                     return
                 }
                 let mid = (low + high) / 2
