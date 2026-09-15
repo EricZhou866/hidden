@@ -28,11 +28,13 @@ Open follow-ups:
   an RTL locale (the edge signal is mirrored there and has not been exercised).
 - **Always-hidden section on 27.** It reuses the regular separator's measurement as a
   proxy instead of calibrating its own item, so on a wide bar its icons can still show.
-- **Safety margin is empirical.** 60pt / 6% is the value that satisfied both measured
-  bounds on one machine: margin 0 was ejected by two icons added after calibration, and
-  margin 120 left the icon nearest the separator showing in a tighter bar. The real bound
-  is "how much another app can add after calibration". Revisit if reports show either
-  failure mode (nothing hidden = overshoot, icons left showing = undershoot).
+- **Re-measurement only happens at collapse time.** If another app adds a menu bar icon
+  while the bar is already collapsed, the cached length can be ejected and hiding stops
+  with no visible sign until the next expand/collapse. A background poll cannot detect
+  this (frames only refresh after the length is written). A fix would be a nudge-based
+  check - rewrite the length as `cached + 1` and read - on
+  `NSWorkspace.didLaunchApplicationNotification`, which is cheap and invisible. Not
+  implemented yet; this was the "it stopped working again" report during development.
 - **Hidden zone must be to the LEFT of the separator, as always.** Icons that end up to
   its right are simply not in the hidden zone and are correctly not hidden; on a fresh
   install the app's own items land leftmost, so the separator has to be ⌘-dragged right
