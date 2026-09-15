@@ -28,9 +28,16 @@ Open follow-ups:
   an RTL locale (the edge signal is mirrored there and has not been exercised).
 - **Always-hidden section on 27.** It reuses the regular separator's measurement as a
   proxy instead of calibrating its own item, so on a wide bar its icons can still show.
-- **Safety margin is empirical.** 120pt / 12% was measured on one bar; the real bound is
-  "how much another app can add after calibration". Revisit if reports show either
+- **Safety margin is empirical.** 60pt / 6% is the value that satisfied both measured
+  bounds on one machine: margin 0 was ejected by two icons added after calibration, and
+  margin 120 left the icon nearest the separator showing in a tighter bar. The real bound
+  is "how much another app can add after calibration". Revisit if reports show either
   failure mode (nothing hidden = overshoot, icons left showing = undershoot).
+- **Hidden zone must be to the LEFT of the separator, as always.** Icons that end up to
+  its right are simply not in the hidden zone and are correctly not hidden; on a fresh
+  install the app's own items land leftmost, so the separator has to be ⌘-dragged right
+  once. This is unchanged from macOS 26 but is easy to mistake for the 27 bug when
+  triaging reports.
 - **Calibration is not persisted.** It re-runs on the first collapse of every launch
   (~1s of separator flicker). Caching in `UserDefaults` keyed by display configuration
   would remove it, at the cost of a stale-cache path.

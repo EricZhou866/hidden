@@ -336,15 +336,23 @@ class StatusBarController {
     private static let ejectionTolerance: CGFloat = 8
     private static let calibrationPrecision: CGFloat = 8
     private static let minimumCalibrationInterval: TimeInterval = 5
-    // Headroom kept below the measured cutoff. The two failure modes are not
-    // symmetric: overshooting ejects the separator and hides NOTHING, while
-    // undershooting only leaves the icons nearest the separator showing. Any icon
-    // another app adds after the measurement moves the cutoff down, so the applied
-    // length keeps a few icons' worth of room. Measured on 27.0: at the bare
-    // cutoff a second process adding two icons broke hiding completely; with this
-    // margin the same icons were hidden.
-    private static let ejectionSafetyMargin: CGFloat = 120
-    private static let ejectionSafetyFraction: CGFloat = 0.12
+    // Headroom kept below the measured cutoff, roughly one icon's width. The two
+    // failure modes are not symmetric: overshooting ejects the separator and hides
+    // NOTHING, while undershooting only leaves the icons nearest the separator
+    // showing. Icons another app adds after the measurement move the cutoff down,
+    // which is what the headroom buys.
+    //
+    // Both bounds were measured on 27.0 (26A428) against a second process holding
+    // the hidden-zone icons:
+    //   - at the bare cutoff (margin 0, applied 1031 of 1031) two icons added
+    //     afterwards ejected the separator and hiding stopped completely;
+    //     applying 979 (margin 52) in the same bar hid them.
+    //   - with too much headroom (margin 120, applied 739 of 859) the icon nearest
+    //     the separator stayed visible; that bar needed 764.
+    // 60pt is the value that satisfies both, and margins of 30-200 all hid
+    // cleanly in the bars where there was room to spare.
+    private static let ejectionSafetyMargin: CGFloat = 60
+    private static let ejectionSafetyFraction: CGFloat = 0.06
 
     private var alwaysHiddenCollapseLength: CGFloat {
         guard Preferences.alwaysHiddenSectionEnabled else { return 0 }

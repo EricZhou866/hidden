@@ -135,11 +135,12 @@ small window per status item, and changed how it responds to an over-long item.
    the requested length. The item's own width tracks the request in **both**
    states and is useless as a signal - this is why the earlier `windowWidth` /
    `buttonWidth` diagnostic could not tell the two apart.
-3. Subtract a safety margin (~120pt) and cache the result. The failure modes are
-   asymmetric: overshooting ejects the separator and hides *nothing*, while
-   undershooting only leaves the icons nearest the separator showing. Any icon
-   another app adds after the measurement moves the cutoff down, so the margin
-   buys a few icons' worth of room.
+3. Subtract a safety margin (60pt, ~one icon) and cache the result. The failure
+   modes are asymmetric: overshooting ejects the separator and hides *nothing*,
+   while undershooting only leaves the icons nearest the separator showing. Any
+   icon another app adds after the measurement moves the cutoff down, so the
+   margin buys about an icon's worth of room. Both bounds are measured, not
+   guessed - see the comment on `ejectionSafetyMargin`.
 4. Re-measure when the display configuration changes, and whenever a collapse
    finds the cached length ejected (rate-limited).
 
