@@ -63,15 +63,25 @@ class StatusBarController {
     
     private var isToggle = false
 
-    // SPEC-003 (macOS 27 hide-mechanism). macOS 27 re-architected the menu bar so
-    // inflating the separator length may no longer push items off-screen (#360).
-    // This is DIAGNOSTIC ONLY: on the first collapse with the menu-bar window
-    // ready, log the separator geometry so a macOS 27 run reveals which signal
-    // (if any) distinguishes "length honored" from "ignored". No behavior change.
-    // The degrade ACTION is deliberately NOT shipped: review found the trigger
-    // unverifiable without 27 hardware, and a false positive would disable hiding
-    // for a working user. The action lands once this log calibrates the signal.
-    private var hideMechanismChecked = false
+    // SPEC-003 (macOS 27 hide-mechanism, #360). macOS 27 re-architected the menu
+    // bar into a single composited surface, and with it the layout response to an
+    // over-long status item: the length is still honored exactly (the separator's
+    // window really does become as wide as asked), but an item too long to fit is
+    // EJECTED from the layout instead of laid out, and an ejected item pushes
+    // nothing. `screenWidth * 2` always lands past that cutoff, so collapsing does
+    // nothing at all - the whole bug.
+    //
+    // The cutoff cannot be computed: it is where the separator would grow past the
+    // left edge of the status region (the notch on some Macs, the frontmost app's
+    // menus on others), so it moves with the display, with the frontmost app, and
+    // with how full the bar already is. It has to be measured on the live bar.
+    private var calibratedCollapseLength: CGFloat?
+    private var isCalibrating = false
+    private var lastCalibrationDate: Date?
+    // Bumped whenever a measurement in flight is invalidated (display change), so
+    // the async probe chain it belongs to drops out instead of writing a result
+    // measured against a menu bar that no longer exists.
+    private var calibrationGeneration = 0
 
     private var hoverMonitor: Any?
     private var hoverDwellTimer: Timer?
@@ -130,7 +140,7 @@ class StatusBarController {
         NSLog("HoverToExpand: enabled, installing global mouse monitor")
         hoverMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
             guard let self = self else { return }
-            guard self.isCollapsed && self.isMouseInMenuBar else {
+            guard !self.isCalibrating, self.isCollapsed && self.isMouseInMenuBar else {
                 self.hoverDwellTimer?.invalidate()
                 self.hoverDwellTimer = nil
                 return
@@ -140,7 +150,7 @@ class StatusBarController {
             self.hoverDwellTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
                 guard let self = self else { return }
                 self.hoverDwellTimer = nil
-                if self.isCollapsed && self.isMouseInMenuBar {
+                if !self.isCalibrating, self.isCollapsed && self.isMouseInMenuBar {
                     self.expandMenubar()
                 }
             }
@@ -152,10 +162,15 @@ class StatusBarController {
         // display hot-plug leaves the separator at a stale length (PR #354).
         let wasCollapsed = isCollapsed
         updateCollapsedLengths()
+        // A display hot-plug moves the status region, so a length calibrated for
+        // the old configuration is meaningless; measure again on the next collapse.
+        calibratedCollapseLength = nil
+        calibrationGeneration += 1
+        isCalibrating = false
         if wasCollapsed {
-            btnSeparate.length = btnHiddenCollapseLength
+            applyCollapseLength()
             if Preferences.areSeparatorsHidden {
-                btnAlwaysHidden?.length = btnAlwaysHiddenEnableExpandCollapseLength
+                btnAlwaysHidden?.length = alwaysHiddenCollapseLength
             }
         }
     }
@@ -227,6 +242,7 @@ class StatusBarController {
     }
     
     func showHideSeparatorsAndAlwayHideArea() {
+        if isCalibrating {return}
         Preferences.areSeparatorsHidden ? self.showSeparators() : self.hideSeparators()
         
         if self.isCollapsed {self.expandMenubar()}
@@ -249,10 +265,14 @@ class StatusBarController {
         if !self.isCollapsed {
             self.btnSeparate.length = self.btnHiddenLength
         }
-        self.btnAlwaysHidden?.length = self.btnAlwaysHiddenEnableExpandCollapseLength
+        self.btnAlwaysHidden?.length = self.alwaysHiddenCollapseLength
     }
     
     func expandCollapseIfNeeded() {
+        // isCollapsed is derived from the separator's length, which sweeps through
+        // the probe widths while calibrating, so a toggle would read the wrong
+        // state. The measurement is sub-second and runs once per configuration.
+        if isCalibrating {return}
         //prevented rapid click cause icon show many in Dock
         if isToggle {return}
         isToggle = true
@@ -268,7 +288,7 @@ class StatusBarController {
             return
         }
 
-        btnSeparate.length = self.btnHiddenCollapseLength
+        applyCollapseLength()
         if let button = btnExpandCollapse.button {
             button.image = Assets.expandImage
         }
@@ -276,7 +296,6 @@ class StatusBarController {
             NSApp.setActivationPolicy(.accessory)
             NSApp.deactivate()
         }
-        verifyHideMechanismIfNeeded()
     }
     private func expandMenubar() {
         guard self.isCollapsed else {return}
@@ -300,29 +319,176 @@ class StatusBarController {
         startTimerToAutoHide()
     }
 
-    // After a collapse, confirm on the next runloop tick (so layout settles) that
-    // the separator actually claimed its inflated width. macOS <= 26 honors it;
-    // a macOS that ignores NSStatusItem.length leaves the slot narrow, meaning
-    // hiding did nothing. Checked once: cheap, and the OS behavior won't change
-    // mid-session.
-    private func verifyHideMechanismIfNeeded() {
-        guard !hideMechanismChecked else { return }
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.isCollapsed else { return }
-            // Need the separator's backing window to measure. If it is not up yet
-            // (early launch), do NOT burn the one-shot check: return and let a
-            // later collapse retry once the window exists.
-            guard let separatorButton = self.btnSeparate.button,
-                  let window = separatorButton.window else { return }
-            self.hideMechanismChecked = true
-            // Log several geometry signals. On macOS <= 26 the inflation is
-            // honored; on macOS 27 it may be ignored. Which of these tracks the
-            // requested length is exactly what a 27 capture must reveal before any
-            // degrade action can trigger on a sound signal.
-            let requested = self.btnHiddenCollapseLength
-            let windowWidth = window.frame.width
-            let buttonWidth = separatorButton.frame.width
-            NSLog("HideMechanism: requested=\(requested) windowWidth=\(windowWidth) buttonWidth=\(buttonWidth) length=\(self.btnSeparate.length)")
+    // macOS 27+ ejects an over-long status item from the menu bar layout instead
+    // of laying it out, so the collapse length has to be measured there. Older
+    // systems reflow around any length and keep the computed one.
+    private static var menuBarEjectsOverlongItems: Bool {
+        // Deliberately a runtime version read, not #available: the SDK this app is
+        // built against need not know about macOS 27 for the check to be correct.
+        return ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27
+    }
+
+    // Layout is applied asynchronously by the menu bar host; reading a frame
+    // sooner than this returns the pre-layout value, which reads as "ejected" and
+    // would collapse the calibration onto its lower bound (= no hiding at all).
+    private static let layoutSettleDelay: TimeInterval = 0.12
+    // How far the separator's arrow-facing edge may drift while still laid out.
+    private static let ejectionTolerance: CGFloat = 8
+    private static let calibrationPrecision: CGFloat = 8
+    private static let minimumCalibrationInterval: TimeInterval = 5
+    // Headroom kept below the measured cutoff. The two failure modes are not
+    // symmetric: overshooting ejects the separator and hides NOTHING, while
+    // undershooting only leaves the icons nearest the separator showing. Any icon
+    // another app adds after the measurement moves the cutoff down, so the applied
+    // length keeps a few icons' worth of room. Measured on 27.0: at the bare
+    // cutoff a second process adding two icons broke hiding completely; with this
+    // margin the same icons were hidden.
+    private static let ejectionSafetyMargin: CGFloat = 120
+    private static let ejectionSafetyFraction: CGFloat = 0.12
+
+    private var alwaysHiddenCollapseLength: CGFloat {
+        guard Preferences.alwaysHiddenSectionEnabled else { return 0 }
+        guard StatusBarController.menuBarEjectsOverlongItems else { return btnAlwaysHiddenEnableExpandCollapseLength }
+        // The always-hidden separator sits further left and therefore has its own,
+        // smaller cutoff; the regular separator's measurement is reused as a proxy
+        // rather than flickering the bar a second time. Worst case it is ejected,
+        // which costs hiding in that section but nothing else.
+        return calibratedCollapseLength ?? btnAlwaysHiddenEnableExpandCollapseLength
+    }
+
+    // The separator grows away from the arrow, so while it is laid out the edge
+    // facing the arrow stays put. An ejected item is placed by itself instead, and
+    // that edge jumps out by roughly the requested length - the one signal that
+    // separates the two states. The item's own width tracks the request in BOTH
+    // states and cannot be used.
+    private var separatorArrowFacingEdge: CGFloat? {
+        guard let button = btnSeparate.button, let window = button.window else { return nil }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return Constant.isUsingLTRLanguage ? frame.maxX : frame.minX
+    }
+
+    private func isSeparatorEjected(baseline: CGFloat) -> Bool {
+        guard let edge = separatorArrowFacingEdge else { return true }
+        if Constant.isUsingLTRLanguage {
+            return edge > baseline + StatusBarController.ejectionTolerance
+        } else {
+            return edge < baseline - StatusBarController.ejectionTolerance
+        }
+    }
+
+    private func afterLayoutSettles(_ work: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + StatusBarController.layoutSettleDelay, execute: work)
+    }
+
+    private func applyCollapseLength() {
+        guard StatusBarController.menuBarEjectsOverlongItems else {
+            btnSeparate.length = btnHiddenCollapseLength
+            return
+        }
+        guard let calibrated = calibratedCollapseLength else {
+            // Not measured yet: the calibration itself ends by applying its result,
+            // so it performs this collapse. Without a backing window there is
+            // nothing to measure against, so fall back to the computed length and
+            // let the next collapse try again - it keeps the length, the arrow
+            // image and the derived isCollapsed state consistent.
+            if btnSeparate.button?.window == nil {
+                btnSeparate.length = btnHiddenCollapseLength
+            } else {
+                calibrateCollapseLength()
+            }
+            return
+        }
+        btnSeparate.length = calibrated
+        // The cutoff moves whenever the bar's contents change, so a length that
+        // was good when measured can be ejected by the time it is applied again.
+        // Writing the length forces a re-layout, which is what makes this read
+        // trustworthy: a read taken WITHOUT changing the length returns the last
+        // computed frame and would report a stale "fine".
+        afterLayoutSettles { [weak self] in
+            guard let self = self, self.isCollapsed, !self.isCalibrating else { return }
+            guard let baseline = self.calibrationBaseline,
+                  self.isSeparatorEjected(baseline: baseline) else { return }
+            // Rate-limited so a bar that genuinely cannot fit the separator does
+            // not thrash: the next collapse will try again.
+            if let last = self.lastCalibrationDate,
+               Date().timeIntervalSince(last) < StatusBarController.minimumCalibrationInterval {
+                return
+            }
+            NSLog("HideMechanism: cached length \(calibrated) is ejected now, re-measuring")
+            self.calibratedCollapseLength = nil
+            self.calibrateCollapseLength()
+        }
+    }
+
+    // The arrow-facing edge as measured with the separator at its resting width,
+    // i.e. the reference an ejected item departs from.
+    private var calibrationBaseline: CGFloat?
+
+    // Binary-search the largest length the menu bar still lays out. Runs once per
+    // display configuration; the separator visibly steps through the probe widths
+    // for about a second, which is why the result is cached.
+    private func calibrateCollapseLength() {
+        guard !isCalibrating, btnSeparate.button?.window != nil else { return }
+        isCalibrating = true
+        calibrationGeneration += 1
+        let generation = calibrationGeneration
+
+        btnSeparate.length = btnHiddenLength
+        afterLayoutSettles { [weak self] in
+            guard let self = self, generation == self.calibrationGeneration else { return }
+            guard let baseline = self.separatorArrowFacingEdge else {
+                self.isCalibrating = false
+                return
+            }
+            self.calibrationBaseline = baseline
+
+            var low = self.btnHiddenLength
+            var high = self.btnHiddenCollapseLength
+            var best = self.btnHiddenLength
+
+            func probe() {
+                guard high - low > StatusBarController.calibrationPrecision else {
+                    self.isCalibrating = false
+                    self.calibrationGeneration += 1
+                    guard best > self.btnHiddenLength else {
+                        // Not even a few points are laid out: this menu bar cannot
+                        // hide anything by inflation. Leave the bar expanded and
+                        // the arrow honest rather than sitting in a collapsed state
+                        // that hides nothing.
+                        NSLog("HideMechanism: no length is laid out on this menu bar, hiding unavailable")
+                        self.lastCalibrationDate = Date()
+                        self.btnSeparate.length = self.btnHiddenLength
+                        self.btnExpandCollapse.button?.image = Assets.collapseImage
+                        return
+                    }
+                    let margin = min(StatusBarController.ejectionSafetyMargin,
+                                     best * StatusBarController.ejectionSafetyFraction)
+                    best -= margin
+                    self.calibratedCollapseLength = best
+                    self.lastCalibrationDate = Date()
+                    NSLog("HideMechanism: calibrated collapse length \(best) (baseline edge \(baseline), ceiling \(self.btnHiddenCollapseLength))")
+                    // Land in whichever state the bar was meant to be in: the
+                    // calibration is what performs the first collapse.
+                    self.btnSeparate.length = best
+                    if Preferences.areSeparatorsHidden {
+                        self.btnAlwaysHidden?.length = self.alwaysHiddenCollapseLength
+                    }
+                    return
+                }
+                let mid = (low + high) / 2
+                self.btnSeparate.length = mid
+                self.afterLayoutSettles {
+                    guard generation == self.calibrationGeneration else { return }
+                    if self.isSeparatorEjected(baseline: baseline) {
+                        high = mid
+                    } else {
+                        best = mid
+                        low = mid
+                    }
+                    probe()
+                }
+            }
+            probe()
         }
     }
     
@@ -333,8 +499,9 @@ class StatusBarController {
             // Don't yank the bar shut mid-interaction: while the pointer is in the
             // menubar (hovering, clicking, dragging icons), defer and re-arm.
             // Intentionally unbounded; each re-arm invalidates the previous timer,
-            // so deferral never accumulates timers.
-            if self.isMouseInMenuBar || self.isPreferencesWindowVisible {
+            // so deferral never accumulates timers. A measurement in flight defers
+            // the same way rather than dropping the pending auto-collapse.
+            if self.isCalibrating || self.isMouseInMenuBar || self.isPreferencesWindowVisible {
                 self.startTimerToAutoHide()
             } else {
                 self.collapseMenuBar()

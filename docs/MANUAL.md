@@ -66,7 +66,8 @@ To undo any of them: `defaults delete com.dwarvesv.minimalbar <key>`.
 | Login item missing after denying it once | System Settings > General > Login Items: re-enable Hidden Bar, then toggle the pref off/on |
 | A ghost "LauncherApplication" login item from old versions | Launch the current version once; it deauthorizes the legacy item automatically |
 | App language stuck | See the `AppleLanguages` command above, or System Settings > General > Language & Region > Applications |
-| Nothing hides on a macOS 27 beta | Known (issue #360); the menu bar re-architecture broke the hiding mechanism, fix under investigation |
+| Nothing hides on macOS 27 | Fixed (issue #360). Update to v1.11 or later: the collapse width is now measured against the live menu bar. On the first collapse after each launch the separator visibly steps through a few widths for about a second - that is the measurement. |
+| On macOS 27, a few icons next to the separator stay visible | The measured width keeps a safety margin, so the icons closest to the separator can remain. ⌘-drag the separator right, or move those icons left of it. |
 | A new or just-updated app's icon shows up already hidden | Expected, see "Why new icons start hidden" below; ⌘-drag it to the right of the separator once |
 
 ### Why new icons start hidden
