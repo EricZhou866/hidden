@@ -125,26 +125,45 @@ small window per status item, and changed how it responds to an over-long item.
 - Items pushed past that left edge are taken into macOS 27's own overflow
   chevron, which is what makes hiding work at all there.
 
-`StatusBarController` therefore **measures** the collapse width:
+`StatusBarController` therefore **measures** the collapse width, using a
+throwaway probe item rather than the separator's own geometry:
 
-1. On the first collapse, read the separator's arrow-facing edge at rest. This is
-   the baseline.
-2. Binary-search the largest length that is still laid out. The signal is that
-   edge: the separator grows *away* from the arrow, so while it is laid out the
-   arrow-facing edge stays put, and an ejected item's edge jumps out by roughly
-   the requested length. The item's own width tracks the request in **both**
-   states and is useless as a signal - this is why the earlier `windowWidth` /
-   `buttonWidth` diagnostic could not tell the two apart.
-3. Subtract a safety margin (60pt, ~one icon) and cache the result. The failure
-   modes are asymmetric: overshooting ejects the separator and hides *nothing*,
-   while undershooting only leaves the icons nearest the separator showing. Any
-   icon another app adds after the measurement moves the cutoff down, so the
-   margin buys about an icon's worth of room. Both bounds are measured, not
-   guessed - see the comment on `ejectionSafetyMargin`.
-4. Re-measure when the display configuration changes, and whenever a collapse
-   finds the cached length ejected (rate-limited).
+1. On the first collapse, create a 1pt status item with no autosave name. macOS
+   inserts a new item at the far LEFT, which is the hidden zone, so this probe
+   stands in for the icons being hidden. Record where it rests.
+2. Binary-search the largest length at which the probe is still driven away from
+   its resting position. That is a direct read of "is the separator actually
+   pushing anything", which is the property that matters.
+3. Step back `ejectionSafetyMargin` (24pt) from the cutoff.
+4. **Re-enter the layout, then climb back up.** Finding the cutoff requires
+   probing past it, which leaves the bar ejected, and a good length written on
+   top of an ejected layout stays ejected - the measurement is then correct and
+   still hides nothing. Worse, once ejected the cutoff itself drops, so a value
+   just under the measured one is also refused: measured on 27.0, after ejecting
+   at 1011pt none of 983 / 953 / 925 re-entered, while 737 did. So: reset to the
+   resting width, step down (x0.75) until a value verifies as pushing, then climb
+   back up (x1.08) - going up from a pushing layout is safe - keeping the last
+   value that still pushes. This recovers the full measured length.
+5. Cache, remove the probe. Re-measure when the display configuration changes,
+   and whenever a collapse finds the cached length ejected (rate-limited).
+
+**Why not read the separator's own frame.** Two signals were tried first and both
+mislead:
+
+- `windowWidth` / `buttonWidth` track the requested length in *both* states, so
+  they cannot tell laid-out from ejected at all. This is what the original #360
+  diagnostic logged, which is why the captures in that thread unblocked nothing.
+- The separator's arrow-facing edge is better - it stays pinned while laid out
+  and jumps out by roughly the requested length once ejected - but it fails near
+  the cutoff, which is exactly where the search converges. Measured on 27.0: the
+  edge signal accepted 1031pt as laid out while the separator was in fact pushing
+  nothing (icons sat at their normal positions); 991pt in the same bar hid them.
+  A binary search on that signal therefore lands above the true cutoff and needs a
+  large, guessed margin to compensate. The probe has no such blind spot: it reads
+  pushed up to 1000pt and snaps back to its resting position at 1050pt.
 
 Reads are only trustworthy right after the length is written: writing it forces a
 re-layout. A frame read taken *without* changing the length returns the last
 computed frame, so a background poll reports a stale "fine" even when hiding has
-actually stopped. That is why there is no watchdog timer.
+actually stopped. That is why there is no watchdog timer, and why a bar that
+changes underneath a collapse is only re-measured at the next collapse.
