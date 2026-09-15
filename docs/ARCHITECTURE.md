@@ -33,6 +33,11 @@ Key consequences of this design:
   (display hot-plug).
 - The length is bounded: `max(500, min(widestFrameWidth * 2, 10_000))`. macOS
   enforces a hard 10,000pt maximum on `NSStatusItem.length`.
+- **On macOS 27+ that computed length is only a ceiling, not the value applied.**
+  macOS 27 ejects a status item too long to fit from the menu bar layout instead
+  of reflowing around it, and an ejected item pushes nothing, so the collapse
+  width is binary-searched against the live bar on the first collapse and cached
+  (see "The macOS 27 menu bar" below).
 - `isCollapsed` is derived state: `separator.length > 20`, deliberately not an
   equality check, so it survives the length being recomputed while collapsed.
 - Icons macOS inserts to the LEFT of the separator (where new status items
@@ -97,9 +102,49 @@ A full-tree audit (2026-06) scored 9/10 with hygiene-level findings only.
 - **The notch**: hidden icons sit "under" the notch area on notched Macs; the
   trick cannot reveal them there. The real fix is a spillover/second-bar design
   (tracked in issues #357/#341/#148; candidate implementations in PRs #350/#358).
-- **macOS 27**: the menu bar re-architecture in macOS 27 betas
-  (`NSMenuBarNavigationSceneExtension`) breaks length-inflation hiding entirely
-  (issue #360). A different mechanism may be required.
+- **macOS 27**: length-inflation still hides, but only within a measured
+  window (see below). The managed-overflow redesign remains the durable fix.
 - **Other apps' open menus**: interaction-awareness is pointer-position-based;
   a pointer deep inside another app's open dropdown is below the menubar band,
   so the collapse can still fire there.
+
+## The macOS 27 menu bar
+
+macOS 27 renders the whole menu bar as one composited surface instead of one
+small window per status item, and changed how it responds to an over-long item.
+
+- `NSStatusItem.length` is still honored exactly: the separator's window really
+  does become as wide as it asks.
+- What changed is the **layout response**. An item too long to fit is *ejected*
+  from the layout rather than laid out, and an ejected item pushes nothing. The
+  old `screenWidth * 2` request always lands past that cutoff, which is why
+  collapsing did nothing at all on 27 (#360).
+- The cutoff is not a constant and cannot be computed: it is where the separator
+  would grow past the left edge of the status region, so it moves with the
+  display, with the frontmost app's menu width, and with how full the bar is.
+- Items pushed past that left edge are taken into macOS 27's own overflow
+  chevron, which is what makes hiding work at all there.
+
+`StatusBarController` therefore **measures** the collapse width:
+
+1. On the first collapse, read the separator's arrow-facing edge at rest. This is
+   the baseline.
+2. Binary-search the largest length that is still laid out. The signal is that
+   edge: the separator grows *away* from the arrow, so while it is laid out the
+   arrow-facing edge stays put, and an ejected item's edge jumps out by roughly
+   the requested length. The item's own width tracks the request in **both**
+   states and is useless as a signal - this is why the earlier `windowWidth` /
+   `buttonWidth` diagnostic could not tell the two apart.
+3. Subtract a safety margin (60pt, ~one icon) and cache the result. The failure
+   modes are asymmetric: overshooting ejects the separator and hides *nothing*,
+   while undershooting only leaves the icons nearest the separator showing. Any
+   icon another app adds after the measurement moves the cutoff down, so the
+   margin buys about an icon's worth of room. Both bounds are measured, not
+   guessed - see the comment on `ejectionSafetyMargin`.
+4. Re-measure when the display configuration changes, and whenever a collapse
+   finds the cached length ejected (rate-limited).
+
+Reads are only trustworthy right after the length is written: writing it forces a
+re-layout. A frame read taken *without* changing the length returns the last
+computed frame, so a background poll reports a stale "fine" even when hiding has
+actually stopped. That is why there is no watchdog timer.

@@ -9,25 +9,38 @@ Source of the current state: the v1.11 issue-clearing pass (2026-06-12), branch
 `fix/v1-11-batch` / draft PR #365, and SPEC-003. Core-model changes (separator length
 math, collapse state machine) are HIGH RISK and require a mandatory review-team pass.
 
-## Blocked on macOS 27 hardware (Han UAT)
+## macOS 27 (#360) - resolved, needs wider hardware coverage
 
-- **macOS 27 hide-mechanism capture (#360).** Run the v1.11 build on real macOS 27,
-  trigger a collapse, capture the `HideMechanism:` NSLog (requested length / host-window
-  width / button width / actual length). This is the unblocker: it reveals which geometry
-  signal separates "honored" from "ignored" on 27. Diagnostic-only instrument already
-  shipped. See SPEC-003 + `StatusBarController.swift` (collapse path).
-- **Redesign the detection signal, then ship Option B (detect-and-degrade).** Review-team
-  found `btnSeparate.button?.window?.frame.width` reads the full menu-bar window width
-  (~1728pt on 26.5), so `honored` is trivially true on every OS. Switch to a positional
-  signal (separator button X-coordinate before vs after collapse). Once the 27 capture
-  calibrates it: re-add the one-shot post-collapse check, a one-time context-menu notice
-  linking #360, and stop re-inflating on confirmed failure. Depends on the capture above.
-- **Fix the 3 review bugs when re-enabling degrade.** (1) move the `hideMechanismChecked`
-  latch to AFTER `honored` is measured (a transient nil window currently burns the
-  one-shot check); (2) drop the `?? requested` nil-fallback that latches detection moot;
-  (3) `degradeHideUnavailable()` must restore the app activation policy under
-  "use full menu bar on expanding", or the bar shows while the app stays `.accessory`.
-  `StatusBarController.swift:316,318,329`.
+The capture this was blocked on was run on macOS 27.0 (26A428, 2048pt single display)
+and the diagnosis changed: `NSStatusItem.length` is **not** ignored on 27. It is honored
+exactly; what changed is the layout response, which *ejects* an item too long to fit
+instead of reflowing around it, and an ejected item pushes nothing. `screenWidth * 2`
+always lands past that cutoff, which is why nothing was hidden. Neither `windowWidth` nor
+`buttonWidth` can detect this - both track the request in either state, so the shipped
+diagnostic could never have separated them. Fix shipped: measure the collapse width
+against the live bar (binary search on the separator's arrow-facing edge), keep a safety
+margin below it, cache per display configuration. See `docs/ARCHITECTURE.md`.
+
+Open follow-ups:
+
+- **Verify on other hardware.** Confirmed only on one machine, one display, no notch,
+  LTR. Wanted: a notched built-in display, a wide (3000pt+) external, mixed widths, and
+  an RTL locale (the edge signal is mirrored there and has not been exercised).
+- **Always-hidden section on 27.** It reuses the regular separator's measurement as a
+  proxy instead of calibrating its own item, so on a wide bar its icons can still show.
+- **Safety margin is empirical.** 60pt / 6% is the value that satisfied both measured
+  bounds on one machine: margin 0 was ejected by two icons added after calibration, and
+  margin 120 left the icon nearest the separator showing in a tighter bar. The real bound
+  is "how much another app can add after calibration". Revisit if reports show either
+  failure mode (nothing hidden = overshoot, icons left showing = undershoot).
+- **Hidden zone must be to the LEFT of the separator, as always.** Icons that end up to
+  its right are simply not in the hidden zone and are correctly not hidden; on a fresh
+  install the app's own items land leftmost, so the separator has to be ⌘-dragged right
+  once. This is unchanged from macOS 26 but is easy to mistake for the 27 bug when
+  triaging reports.
+- **Calibration is not persisted.** It re-runs on the first collapse of every launch
+  (~1s of separator flicker). Caching in `UserDefaults` keyed by display configuration
+  would remove it, at the cost of a stale-cache path.
 
 ## Blocked on external-display hardware
 
@@ -71,7 +84,8 @@ math, collapse state machine) are HIGH RISK and require a mandatory review-team 
 - **Managed-overflow / second-bar redesign.** The real fix that gates ~30 issues across
   four clusters: icon-drift (#28, #156, #181, #230, #231, #239, #252, #254, #275, #283,
   #321, #334), always-hidden (#171, #224, #242, #288), notch (#206, #225, #228, #245,
-  #267, #269, #280, #292, #330), and macOS 27 (#360). Replaces length-inflation with a
+  #267, #269, #280, #292, #330), and macOS 27 (#360, now mitigated but still built on
+  a mechanism the OS can withdraw). Replaces length-inflation with a
   managed overflow bar, likely via Accessibility. Needs a design decision from Han +
   macOS 27 hardware. Design + folded M1 (pin icons, persist order) / M2 (decouple
   always-hidden from `areSeparatorsHidden`, recover stuck items) in SPEC-003.
